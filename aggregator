@@ -1,0 +1,103 @@
+#!/usr/bin/env python
+#
+# Copyright (c) 2015 Catalyst.net Ltd
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+# Written by Douglas Bagnall <douglas.bagnall@catalyst.net.nz>
+# with bits by Michael Fincham <michael.fincham@catalyst.net.nz>
+
+import argparse
+import ConfigParser
+import logging
+import os
+import sys
+import time
+
+from bisect import bisect
+
+from ethernet import Frame
+from sflow import decode_sflow_packet
+import ipaddr
+
+from twisted.web import server, resource
+from twisted.internet import reactor
+from twisted.internet.protocol import DatagramProtocol
+
+
+class SFlowDecoder(DatagramProtocol):
+    SFLOW_SAMPLE_TYPES = {
+        'flow': 1,
+        'counter': 2,
+    }
+
+    def __init__(self, aggregator, host='0.0.0.0', port=6343):
+        self.aggregator = aggregator
+        self.remote_host = host
+        self.remote_port = port
+
+    def startProtocol(self):
+        self.transport.connect(self.remote_host, self.remote_port)
+
+    def datagramReceived(self, data, (host, port)):
+        print >>sys.stderr, "received %r from %s:%d" % (data, host, port)
+        packet = decode_sflow_packet(payload)
+        self.aggregator.handle_packet(packet)
+
+
+class SFlowReport(resource.Resource):
+    isLeaf = True
+
+    def __init__(self, *args, **kwargs):
+        resource.Resource.__init__(self, *args, **kwargs)
+        self.packets = []
+
+    def render_GET(self, request):
+        since_unsafe = request.args["since", ['600']][0]
+        keep_older_unsafe = request.args.get("keep", ['no'])[0]
+        keep_older = keep_older_unsafe.lower() in ('1', 'true', 'yes')
+        now = time.time()
+        try:
+            since_tuple = time.strptime(since_unsafe, "%Y-%m-%d %H:%M:%S")
+            since_secs = int(time.mktime(since_tuple))
+        except ValueError:
+            try:
+                elapsed_secs = int(since_unsafe)
+                since_secs = now - elapsed_secs
+            except ValueError:
+                return resource.ErrorPage(500,
+                                          "I can't comprehend the time %r" %
+                                          since_unsafe) #XXX: XSS right here
+
+        since_packet = (since_secs,)
+        since_index = bisect(self.packets, since_packet)
+        packets = self.packets[since_index:]
+        if not keep_older:
+            self.packets = []
+
+        return ("<html>Hello! packets in the last %d seconds are:\n"
+                "<pre>%s</html>" % (now - since_secs,
+                                    "\n".join(str(x) for x in packets)))
+
+    def handle_packet(self, packet):
+        self.packets.append((time.time(), packet))
+
+
+def main():
+    report = SFlowReport()
+    site = server.Site(report)
+    reactor.listenUDP(65535, SFlowDecoder(report))
+    reactor.listenTCP(8000, site)
+    reactor.run()
+
+main()
